@@ -112,6 +112,7 @@ def main():
     if use_cuda:
         torch.cuda.manual_seed(args.seed)
         torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
     print( "args.seed=", args.seed, "device=", device )
     
     kwargs = {'num_workers': 1, 'pin_memory': True} if use_cuda else {}

@@ -12,6 +12,8 @@ from torchvision import datasets, transforms
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.tensorboard import SummaryWriter
 
+CHANGE_CRITERION_TRAIN = False
+
 class Net(nn.Module):
     def __init__(self):
         super(Net, self).__init__()
@@ -37,7 +39,7 @@ class Net(nn.Module):
         output = F.log_softmax(x, dim=1)
         return output
 
-def train(args, model, device, train_loader, optimizer, epoch):
+def train(args, model, device, train_loader, criterion, optimizer, epoch):
     model.train()
     train_loss = 0
     correct = 0
@@ -45,21 +47,24 @@ def train(args, model, device, train_loader, optimizer, epoch):
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
         output = model(data)
-        loss = F.nll_loss(output, target)
+        loss = criterion(output, target)
         loss.backward()
         optimizer.step()
-        train_loss += loss.item() * data.size(0)   # sum up batch loss (F.nll_lossでreduction='sum'とするのと同じはず)
+        if CHANGE_CRITERION_TRAIN:
+            train_loss += loss.item()
+        else:
+            train_loss += loss.item() * data.size(0) # sum up batch loss (F.nll_lossでreduction='sum'とするのと同じはず)
         pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
         correct += pred.eq(target.view_as(pred)).sum().item()
         
         if batch_idx % args.log_interval == 0:
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                 epoch, batch_idx * len(data), len(train_loader.dataset),
-                100. * batch_idx / len(train_loader), loss.item()))
+                100. * batch_idx / len(train_loader), loss.item() / data.size(0) if CHANGE_CRITERION_TRAIN else loss.item()))
     
     return correct / len(train_loader.dataset), train_loss / len(train_loader.dataset)
 
-def test(args, model, device, test_loader):
+def test(args, model, device, test_loader, criterion):
     model.eval()
     test_loss = 0
     correct = 0
@@ -67,7 +72,7 @@ def test(args, model, device, test_loader):
         for ii, (data, target) in enumerate(test_loader):
             data, target = data.to(device), target.to(device)
             output = model(data)
-            test_loss += F.nll_loss(output, target, reduction='sum').item()  # sum up batch loss
+            test_loss += criterion(output, target).item() # sum up batch loss
             pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
             correct += pred.eq(target.view_as(pred)).sum().item()
     
@@ -131,6 +136,10 @@ def main():
         batch_size=args.test_batch_size, shuffle=True, **kwargs)
     
     model = Net().to(device)
+    
+    criterion_trn = nn.NLLLoss()
+    criterion_tst = nn.NLLLoss(reduction='sum')
+    
     optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
     
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
@@ -138,13 +147,18 @@ def main():
     writer = SummaryWriter()
     
     for epoch in range(1, args.epochs + 1):
-        trn_acc1, trn_loss = train(args, model, device, train_loader, optimizer, epoch)
-        val_acc1, val_loss = test(args, model, device, test_loader)
+        if CHANGE_CRITERION_TRAIN:
+            trn_acc1, trn_loss = train(args, model, device, train_loader, criterion_tst, optimizer, epoch)
+        else:
+            trn_acc1, trn_loss = train(args, model, device, train_loader, criterion_trn, optimizer, epoch)
+        val_acc1, val_loss = test(args, model, device, test_loader, criterion_tst)
+        
         writer.add_scalar('Loss/train', trn_loss, epoch)
         writer.add_scalar('Loss/test', val_loss, epoch)
         writer.add_scalar('Accuracy/train', trn_acc1, epoch)
         writer.add_scalar('Accuracy/test', val_acc1, epoch)
         writer.add_scalar('LearningRate', optimizer.param_groups[0]['lr'], epoch)
+        
         scheduler.step()
     
     if args.save_model:

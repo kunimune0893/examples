@@ -5,6 +5,7 @@ import argparse
 import numpy as np
 
 import torch
+import torchvision
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -12,7 +13,7 @@ from torchvision import datasets, transforms
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.tensorboard import SummaryWriter
 
-CHANGE_CRITERION_TRAIN = False
+EN_CROSS_ENTROPY = True
 
 class Net(nn.Module):
     def __init__(self):
@@ -36,8 +37,27 @@ class Net(nn.Module):
         x = F.relu(x)
         x = self.dropout2(x)
         x = self.fc2(x)
-        output = F.log_softmax(x, dim=1)
+        if EN_CROSS_ENTROPY:
+            output = x
+        else:
+            output = F.log_softmax(x, dim=1)
         return output
+
+class LabelSmoothingLoss(nn.Module):
+    def __init__(self, classes, smoothing=0.0, nllloss=False):
+        super(LabelSmoothingLoss, self).__init__()
+        self.smoothing = smoothing
+        self.cls = classes
+        self.nll = nllloss
+    
+    def forward(self, pred, target):
+        if not self.nll:
+            pred = pred.log_softmax(dim=-1)
+        with torch.no_grad():
+            true_dist = torch.zeros_like(pred)
+            true_dist.fill_(self.smoothing / (self.cls - 1))
+            true_dist.scatter_(1, target.data.unsqueeze(1), 1.0 - self.smoothing)
+        return torch.mean(torch.sum(-true_dist * pred, dim=-1))
 
 def train(args, model, device, train_loader, criterion, optimizer, epoch):
     model.train()
@@ -47,24 +67,23 @@ def train(args, model, device, train_loader, criterion, optimizer, epoch):
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
         output = model(data)
+        #smooth_label = smooth_one_hot(target, output.size(-1), args.smooth)
+        #loss = criterion(output, smooth_label)
         loss = criterion(output, target)
         loss.backward()
         optimizer.step()
-        if CHANGE_CRITERION_TRAIN:
-            train_loss += loss.item()
-        else:
-            train_loss += loss.item() * data.size(0) # sum up batch loss (F.nll_lossでreduction='sum'とするのと同じはず)
+        train_loss += loss.item() * data.size(0) # sum up batch loss
         pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
         correct += pred.eq(target.view_as(pred)).sum().item()
         
         if batch_idx % args.log_interval == 0:
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                 epoch, batch_idx * len(data), len(train_loader.dataset),
-                100. * batch_idx / len(train_loader), loss.item() / data.size(0) if CHANGE_CRITERION_TRAIN else loss.item()))
+                100. * batch_idx / len(train_loader), loss.item()))
     
     return correct / len(train_loader.dataset), train_loss / len(train_loader.dataset)
 
-def test(args, model, device, test_loader, criterion):
+def test(args, model, device, test_loader, criterion, writer=None):
     model.eval()
     test_loss = 0
     correct = 0
@@ -72,9 +91,17 @@ def test(args, model, device, test_loader, criterion):
         for ii, (data, target) in enumerate(test_loader):
             data, target = data.to(device), target.to(device)
             output = model(data)
-            test_loss += criterion(output, target).item() # sum up batch loss
+            test_loss += criterion(output, target).item()  # sum up batch loss
             pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
             correct += pred.eq(target.view_as(pred)).sum().item()
+            
+            if writer is not None and ii == 0:
+                print("output.shape=", output.shape, "pred.shape=", pred.shape, "target.shape=", target.shape )
+                #print("pred=", pred)
+                #print("target=", target)
+                grid = torchvision.utils.make_grid(data)
+                writer.add_image('images', grid, 0)
+                writer.add_graph(model, data)
     
     test_loss /= len(test_loader.dataset)
     
@@ -101,12 +128,17 @@ def main():
                         help='disables CUDA training')
     parser.add_argument('--seed', type=int, default=1, metavar='S',
                         help='random seed (default: 1)')
+    parser.add_argument('--smooth', type=float, default=0.0, metavar='SM',
+                        help='for smooth labeling (default: 0.0)')
     parser.add_argument('--log-interval', type=int, default=10, metavar='N',
                         help='how many batches to wait before logging training status')
     
     parser.add_argument('--save-model', action='store_true', default=False,
                         help='For Saving the current Model')
     args = parser.parse_args()
+    
+    print( "2020/03/20 23:35" )
+    
     use_cuda = not args.no_cuda and torch.cuda.is_available()
     
     random.seed(args.seed)
@@ -137,8 +169,12 @@ def main():
     
     model = Net().to(device)
     
-    criterion_trn = nn.NLLLoss()
-    criterion_tst = nn.NLLLoss(reduction='sum')
+    if EN_CROSS_ENTROPY:
+        criterion_trn = LabelSmoothingLoss(len(train_loader.dataset.classes), args.smooth)
+        criterion_tst = nn.NLLLoss(reduction='sum')
+    else:
+        criterion_trn = nn.NLLLoss()
+        criterion_tst = nn.NLLLoss(reduction='sum')
     
     optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
     
@@ -147,10 +183,7 @@ def main():
     writer = SummaryWriter()
     
     for epoch in range(1, args.epochs + 1):
-        if CHANGE_CRITERION_TRAIN:
-            trn_acc1, trn_loss = train(args, model, device, train_loader, criterion_tst, optimizer, epoch)
-        else:
-            trn_acc1, trn_loss = train(args, model, device, train_loader, criterion_trn, optimizer, epoch)
+        trn_acc1, trn_loss = train(args, model, device, train_loader, criterion_trn, optimizer, epoch)
         val_acc1, val_loss = test(args, model, device, test_loader, criterion_tst)
         
         writer.add_scalar('Loss/train', trn_loss, epoch)
